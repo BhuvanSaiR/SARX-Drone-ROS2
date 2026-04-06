@@ -2,6 +2,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
 import time
+import math
 
 
 class MissionNode(Node):
@@ -9,19 +10,44 @@ class MissionNode(Node):
     def __init__(self):
         super().__init__('mission_node')
 
-        # ---- STATE ----
+        # ============================
+        # STATE MACHINE
+        # ============================
         self.state = "SEARCHING"
-        self.last_detection_time = time.time()
 
-        # ---- SUBSCRIBE (Perception) ----
-        self.sub = self.create_subscription(
+        # ============================
+        # WAYPOINT SYSTEM
+        # ============================
+        self.waypoints = []
+        self.current_wp = 0
+        self.wp_tolerance = 1.5  # meters
+
+        # ============================
+        # CHECKPOINT SYSTEM
+        # ============================
+        self.checkpoint = None
+        self.returning_from_drop = False
+
+        # ============================
+        # SUBSCRIBERS
+        # ============================
+        self.perception_sub = self.create_subscription(
             Float32MultiArray,
             '/perception/target',
             self.perception_callback,
             10
         )
 
-        # ---- PUBLISH (Commands) ----
+        self.wp_sub = self.create_subscription(
+            Float32MultiArray,
+            '/mission_waypoints',
+            self.waypoint_callback,
+            10
+        )
+
+        # ============================
+        # PUBLISHERS
+        # ============================
         self.cmd_pub = self.create_publisher(
             Float32MultiArray,
             '/command',
@@ -34,53 +60,95 @@ class MissionNode(Node):
             10
         )
 
-        self.get_logger().info("Mission node started")
+        self.gps_pub = self.create_publisher(
+            Float32MultiArray,
+            '/goto_gps',
+            10
+        )
 
-    # ============================
-    # MAIN STATE MACHINE
-    # ============================
+        # ============================
+        # TIMERS
+        # ============================
+        self.timer = self.create_timer(0.1, self.control_loop)
+
+        # ============================
+        # CURRENT STATE DATA
+        # ============================
+        self.detected = False
+        self.approach = False
+        self.cx = 0.0
+        self.cy = 0.0
+        self.area = 0.0
+
+        self.get_logger().info("Mission node fully initialized")
+
+    # ======================================
+    # CALLBACKS
+    # ======================================
 
     def perception_callback(self, msg):
+        self.detected, self.approach, self.cx, self.cy, self.area = msg.data
 
-        detected, approach, cx, cy, area = msg.data
+    def waypoint_callback(self, msg):
 
-        # -------- SEARCHING --------
+        data = msg.data
+        self.waypoints = []
+
+        for i in range(0, len(data), 2):
+            lat = data[i]
+            lon = data[i + 1]
+            self.waypoints.append((lat, lon))
+
+        self.current_wp = 0
+
+        self.get_logger().info(f"Loaded {len(self.waypoints)} waypoints")
+
+    # ======================================
+    # MAIN CONTROL LOOP
+    # ======================================
+
+    def control_loop(self):
+
+        # -------- SEARCHING (Waypoint Following) --------
         if self.state == "SEARCHING":
 
-            if detected:
-                self.get_logger().info("Target detected → APPROACHING")
+            if self.detected:
+                self.get_logger().info("Human detected → APPROACHING")
+
                 self.save_checkpoint()
                 self.state = "APPROACHING"
+                return
+
+            self.follow_waypoints()
 
         # -------- APPROACHING --------
         elif self.state == "APPROACHING":
 
-            if not detected:
+            if not self.detected:
                 self.get_logger().info("Lost target → CENTERING")
                 self.state = "CENTERING"
                 return
 
-            # Move forward + yaw alignment
-            self.publish_movement(1.0, cx, 0.0)
+            # Move forward + yaw correction
+            self.publish_velocity(1.0, self.cx, 0.0)
 
         # -------- CENTERING --------
         elif self.state == "CENTERING":
 
-            # Use cx, cy to center (later bottom cam)
-            if abs(cx) < 0.05 and abs(cy) < 0.05:
+            if abs(self.cx) < 0.05 and abs(self.cy) < 0.05:
                 self.get_logger().info("Centered → DESCENDING")
                 self.state = "DESCENDING"
                 return
 
-            self.publish_movement(0.0, cx, cy)
+            self.publish_velocity(0.0, self.cx, self.cy)
 
         # -------- DESCENDING --------
         elif self.state == "DESCENDING":
 
             self.get_logger().info("Descending...")
-            self.publish_movement(0.0, 0.0, -0.5)
+            self.publish_velocity(0.0, 0.0, -0.5)
 
-            time.sleep(2)  # simple placeholder
+            time.sleep(2)
 
             self.state = "DROPPING"
 
@@ -89,45 +157,83 @@ class MissionNode(Node):
 
             self.get_logger().info("Dropping payload")
 
-            drop_msg = Float32MultiArray()
-            drop_msg.data = [1.0]
-
-            self.drop_pub.publish(drop_msg)
+            msg = Float32MultiArray()
+            msg.data = [1.0]
+            self.drop_pub.publish(msg)
 
             time.sleep(1)
 
+            self.returning_from_drop = True
             self.state = "RETURNING"
 
         # -------- RETURNING --------
         elif self.state == "RETURNING":
 
-            self.get_logger().info("Returning to checkpoint")
+            if self.checkpoint is None:
+                self.get_logger().warn("No checkpoint → SEARCHING")
+                self.state = "SEARCHING"
+                return
 
-            self.publish_movement(-1.0, 0.0, 0.0)
+            lat, lon = self.checkpoint
+            self.publish_gps_target(lat, lon)
 
-            time.sleep(2)
+            if self.reached_checkpoint():
+                self.get_logger().info("Reached checkpoint → SEARCHING")
 
-            self.state = "SEARCHING"
+                self.returning_from_drop = False
+                self.state = "SEARCHING"
 
-    # ============================
+    # ======================================
+    # WAYPOINT FOLLOWING
+    # ======================================
+
+    def follow_waypoints(self):
+
+        if len(self.waypoints) == 0:
+            return
+
+        lat, lon = self.waypoints[self.current_wp]
+
+        self.publish_gps_target(lat, lon)
+
+        if self.reached_waypoint(lat, lon):
+            self.get_logger().info(f"Reached WP {self.current_wp}")
+
+            self.current_wp += 1
+
+            if self.current_wp >= len(self.waypoints):
+                self.get_logger().info("Mission complete")
+                self.current_wp = 0
+
+    # ======================================
     # HELPERS
-    # ============================
+    # ======================================
 
-    def publish_movement(self, forward, cx, cy):
+    def publish_velocity(self, forward, yaw, vertical):
 
-        cmd = Float32MultiArray()
+        msg = Float32MultiArray()
+        msg.data = [float(forward), float(yaw), float(vertical)]
+        self.cmd_pub.publish(msg)
 
-        # format: [forward, yaw_correction, vertical]
-        cmd.data = [
-            float(forward),
-            float(cx),
-            float(cy)
-        ]
+    def publish_gps_target(self, lat, lon):
 
-        self.cmd_pub.publish(cmd)
+        msg = Float32MultiArray()
+        msg.data = [float(lat), float(lon)]
+        self.gps_pub.publish(msg)
 
     def save_checkpoint(self):
-        self.get_logger().info("Checkpoint saved (placeholder)")
+        # Placeholder (replace with real GPS reading later)
+        if self.current_wp < len(self.waypoints):
+            self.checkpoint = self.waypoints[self.current_wp]
+            self.get_logger().info(f"Checkpoint saved: {self.checkpoint}")
+
+    def reached_waypoint(self, lat, lon):
+        # Placeholder logic
+        return True
+
+    def reached_checkpoint(self):
+        # Placeholder logic
+        return True
 
 
 def main():
