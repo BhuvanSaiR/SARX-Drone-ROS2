@@ -82,6 +82,34 @@ class MissionNode(Node):
 
         self.get_logger().info("Mission node fully initialized")
 
+        # ---- GPS State ----
+        self.current_lat = None
+        self.current_lon = None
+        self.gps_sub = self.create_subscription(
+            Float32MultiArray,
+            '/gps',
+            self.gps_callback,
+            10
+        )
+        # ============================
+        # PID PARAMETERS
+        # ============================
+
+        self.kp = 0.8
+        self.ki = 0.0
+        self.kd = 0.2
+
+        # X-axis (left-right / yaw)
+        self.prev_error_x = 0.0
+        self.integral_x = 0.0
+
+        # Y-axis (up-down)
+        self.prev_error_y = 0.0
+        self.integral_y = 0.0
+
+        self.prev_time = time.time()
+
+
     # ======================================
     # CALLBACKS
     # ======================================
@@ -135,12 +163,53 @@ class MissionNode(Node):
         # -------- CENTERING --------
         elif self.state == "CENTERING":
 
-            if abs(self.cx) < 0.05 and abs(self.cy) < 0.05:
+            now = time.time()
+            dt = now - self.prev_time
+            self.prev_time = now
+
+            error_x = self.cx
+            error_y = self.cy
+
+            # PID for X (yaw)
+            output_x, self.integral_x = self.pid_control(
+                error_x,
+                self.prev_error_x,
+                self.integral_x,
+                dt
+            )
+
+            # PID for Y (vertical)
+            output_y, self.integral_y = self.pid_control(
+                error_y,
+                self.prev_error_y,
+                self.integral_y,
+                dt
+            )
+
+            self.prev_error_x = error_x
+            self.prev_error_y = error_y
+
+            # Clamp outputs (VERY IMPORTANT)
+            output_x = max(min(output_x, 1.0), -1.0)
+            output_y = max(min(output_y, 1.0), -1.0)
+
+            self.get_logger().info(
+                f"PID -> X: {output_x:.2f}, Y: {output_y:.2f}"
+            )
+
+            # Check centered condition
+            if abs(error_x) < 0.03 and abs(error_y) < 0.03:
                 self.get_logger().info("Centered → DESCENDING")
+
+                # Reset PID integrals for next phase
+                self.integral_x = 0.0
+                self.integral_y = 0.0
+
                 self.state = "DESCENDING"
                 return
 
-            self.publish_velocity(0.0, self.cx, self.cy)
+            # Apply smooth control
+            self.publish_velocity(0.0, output_x, output_y)
 
         # -------- DESCENDING --------
         elif self.state == "DESCENDING":
@@ -214,6 +283,9 @@ class MissionNode(Node):
         msg = Float32MultiArray()
         msg.data = [float(forward), float(yaw), float(vertical)]
         self.cmd_pub.publish(msg)
+        forward = max(min(forward, 1.0), -1.0)
+        yaw = max(min(yaw, 1.0), -1.0)
+        vertical = max(min(vertical, 1.0), -1.0)
 
     def publish_gps_target(self, lat, lon):
 
@@ -228,14 +300,75 @@ class MissionNode(Node):
             self.get_logger().info(f"Checkpoint saved: {self.checkpoint}")
 
     def reached_waypoint(self, lat, lon):
-        # Placeholder logic
-        return True
+
+        if self.current_lat is None:
+            return False
+
+        dist = self.distance_meters(
+            self.current_lat,
+            self.current_lon,
+            lat,
+            lon
+        )
+
+        self.get_logger().info(f"Distance to WP: {dist:.2f} m")
+
+        return dist < self.wp_tolerance
 
     def reached_checkpoint(self):
-        # Placeholder logic
-        return True
 
+        if self.checkpoint is None:
+            return False
 
+        if self.current_lat is None:
+            return False
+
+        lat, lon = self.checkpoint
+
+        dist = self.distance_meters(
+            self.current_lat,
+            self.current_lon,
+            lat,
+            lon
+        )
+
+        self.get_logger().info(f"Distance to checkpoint: {dist:.2f} m")
+
+        return dist < self.wp_tolerance
+    
+    def gps_callback(self, msg):
+        self.current_lat = msg.data[0]
+        self.current_lon = msg.data[1] 
+
+    def distance_meters(self, lat1, lon1, lat2, lon2):
+
+        R = 6371000  # meters
+
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+
+        dphi = math.radians(lat2 - lat1)
+        dlambda = math.radians(lon2 - lon1)
+
+        a = math.sin(dphi/2)**2 + \
+            math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
+
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+        return R * c 
+    def pid_control(self, error, prev_error, integral, dt):
+
+        integral += error * dt
+        derivative = (error - prev_error) / dt if dt > 0 else 0.0
+
+        output = (
+            self.kp * error +
+            self.ki * integral +
+            self.kd * derivative
+        )
+
+        return output, integral
+    
 def main():
     rclpy.init()
     node = MissionNode()

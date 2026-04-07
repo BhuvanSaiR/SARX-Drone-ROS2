@@ -21,7 +21,12 @@ class ControlNode(Node):
             self.command_callback,
             10
         )
-
+        # ---- GPS Publisher ----
+        self.gps_pub = self.create_publisher(
+            Float32MultiArray,
+            '/gps',
+            10
+        )
         # ---- Drone setup ----
         self.drone = System()
         self.loop = asyncio.new_event_loop()
@@ -37,6 +42,7 @@ class ControlNode(Node):
     def run_loop(self):
         asyncio.set_event_loop(self.loop)
         self.loop.run_until_complete(self.connect())
+        asyncio.create_task(self.publish_gps())
 
     async def connect(self):
         self.get_logger().info("Connecting to drone...")
@@ -58,7 +64,8 @@ class ControlNode(Node):
         )
 
         await self.drone.offboard.start()
-
+        # Start GPS streaming
+        asyncio.create_task(self.publish_gps())
         self.get_logger().info("Offboard mode started")
 
     # ============================
@@ -89,6 +96,16 @@ class ControlNode(Node):
         except Exception as e:
             self.get_logger().error(f"Command failed: {e}")
 
+    async def publish_gps(self):
+        async for position in self.drone.telemetry.position():
+
+            lat = position.latitude_deg
+            lon = position.longitude_deg
+
+            msg = Float32MultiArray()
+            msg.data = [lat, lon]
+
+            self.gps_pub.publish(msg)
 
 def main():
     rclpy.init()
