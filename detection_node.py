@@ -24,7 +24,7 @@ class DetectionNode(Node):
         self.sub = self.create_subscription(
             Image,
             '/camera/front',
-            self.image_callback,
+            self.front_callback,
             10
         )
 
@@ -54,14 +54,57 @@ class DetectionNode(Node):
         self.IMG_SIZE = 320
         self.CONF_THRES = 0.25
         self.IOU_THRES = 0.45
+        self.sub_bottom = self.create_subscription(
+            Image,
+            '/camera/bottom',
+            self.bottom_callback,
+            10
+        )
 
-    def image_callback(self, msg):
+        self.pub_bottom = self.create_publisher(
+            Float32MultiArray,
+            '/detection/bottom',
+            10
+        )
+
+    def front_callback(self, msg):
+        self.process_frame(msg, self.pub)
+
+    def bottom_callback(self, msg):
+        self.process_frame(msg, self.pub_bottom)
+    
+    # def process_frame(self, msg, publisher):
+        # # Convert ROS Image to OpenCV
+        # cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+        # # Preprocess for YOLO
+        # img = cv2.resize(cv_image, (self.IMG_SIZE, self.IMG_SIZE))
+        # img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB and HWC to CHW
+        # img = np.ascontiguousarray(img) / 255.0  # Normalize
+
+        # with torch.no_grad():
+        #     input_tensor = torch.from_numpy(img).float().unsqueeze(0).to(self.device)
+        #     pred = self.model(input_tensor)[0]
+        #     pred = non_max_suppression(pred, self.CONF_THRES, self.IOU_THRES)
+
+        # detections = []
+        # if pred[0] is not None:
+        #     for *box, conf, cls in pred[0].cpu().numpy():
+        #         x_center = (box[0] + box[2]) / 2
+        #         y_center = (box[1] + box[3]) / 2
+        #         detections.append((x_center, y_center))
+
+        # # Publish detections as Float32MultiArray
+        # msg_out = Float32MultiArray()
+        # msg_out.data = [coord for det in detections for coord in det]
+        # publisher.publish(msg_out)
+    def process_frame(self, msg, publisher):
 
         # Convert ROS → OpenCV
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         orig_h, orig_w = frame.shape[:2]
 
-        # ---- YOUR PREPROCESS ----
+        # ---- PREPROCESS ----
         img = cv2.resize(frame, (self.IMG_SIZE, self.IMG_SIZE))
         img = img.transpose(2, 0, 1)
 
@@ -79,11 +122,11 @@ class DetectionNode(Node):
             iou_thres=self.IOU_THRES
         )
 
-        # ---- EXTRACT PERSON INFO (YOUR LOGIC) ----
+        # ---- EXTRACT INFO ----
         area_ratio = 0.0
         cx = 0.0
         cy = 0.0
-        found = False
+        found = 0.0
 
         det = pred[0] if len(pred) > 0 else []
 
@@ -96,7 +139,7 @@ class DetectionNode(Node):
 
             for *xyxy, conf, cls in det:
 
-                if int(cls) != 0:  # only person
+                if int(cls) != 0:
                     continue
 
                 x1, y1, x2, y2 = map(float, xyxy)
@@ -114,21 +157,15 @@ class DetectionNode(Node):
                     cx = (center_x - orig_w/2) / (orig_w/2)
                     cy = (center_y - orig_h/2) / (orig_h/2)
 
-                    found = True
+                    found = 1.0
 
             area_ratio = max_area / (orig_w * orig_h)
 
         # ---- PUBLISH ----
         msg_out = Float32MultiArray()
-        msg_out.data = [
-            float(found),
-            float(area_ratio),
-            float(cx),
-            float(cy)
-        ]
+        msg_out.data = [found, area_ratio, cx, cy]
 
-        self.pub.publish(msg_out)
-
+        publisher.publish(msg_out)
 
 def main():
     rclpy.init()
