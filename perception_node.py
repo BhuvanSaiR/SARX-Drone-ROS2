@@ -23,36 +23,57 @@ class PerceptionNode(Node):
             10
         )
 
+        self.sub_bottom = self.create_subscription(
+            Float32MultiArray,
+            '/detection/bottom',
+            self.bottom_callback,
+            10
+        )
+
+        self.bottom_data = None
+        self.front_data = None
+
+        self.cam_sub = self.create_subscription(
+            Float32MultiArray,
+            '/active_camera',
+            self.camera_callback,
+            10
+        )
         # ---- YOUR THRESHOLDS ----
         self.AREA_THRESHOLD_FRONT = 0.15
-
+        self.AREA_THRESHOLD_BOTTOM = 0.15
         self.get_logger().info("Perception node started")
+        self.active_camera = "front"
 
     def detection_callback(self, msg):
+        self.front_data = msg.data
 
-        found, area, cx, cy = msg.data
+    def bottom_callback(self, msg):
+        self.bottom_data = msg.data
 
-        target_detected = False
-        approach = False
+    def process(self):
 
-        # ---- YOUR LOGIC MOVED HERE ----
-        if found:
-            target_detected = True
+        if self.active_camera == "front":
+            data = self.front_data
+        else:
+            data = self.bottom_data
 
-            if area > self.AREA_THRESHOLD_FRONT:
-                approach = True
+        if data is None:
+            return
 
-        # ---- OUTPUT MESSAGE ----
+        found, area, cx, cy = data
+
+        target_detected = found
+        approach = area > 0.15
+
         out = Float32MultiArray()
-
-        # Format:
-        # [detected, approach_flag, cx, cy, area]
-        out.data = [
-            float(target_detected),
-            float(approach),
-            float(cx),
-            float(cy),
-            float(area)
-        ]
+        out.data = [found, approach, cx, cy, area]
 
         self.pub.publish(out)
+        
+    def camera_callback(self, msg):
+
+        if msg.data[0] == 0.0:
+            self.active_camera = "front"
+        else:
+            self.active_camera = "bottom"

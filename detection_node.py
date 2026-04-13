@@ -12,7 +12,6 @@ from models.yolo import Model
 from utils.general import non_max_suppression, scale_boxes, check_yaml
 from utils.torch_utils import select_device
 
-
 class DetectionNode(Node):
 
     def __init__(self):

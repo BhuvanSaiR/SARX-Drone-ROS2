@@ -66,6 +66,12 @@ class MissionNode(Node):
             10
         )
 
+        self.cam_pub = self.create_publisher(
+            Float32MultiArray,
+            '/active_camera',
+            10
+        )
+
         # ============================
         # TIMERS
         # ============================
@@ -139,12 +145,13 @@ class MissionNode(Node):
 
         # -------- SEARCHING (Waypoint Following) --------
         if self.state == "SEARCHING":
-
+            self.set_camera("front")
             if self.detected:
                 self.get_logger().info("Human detected → APPROACHING")
 
                 self.save_checkpoint()
                 self.state = "APPROACHING"
+                self.set_camera("front")
                 return
 
             self.follow_waypoints()
@@ -155,6 +162,7 @@ class MissionNode(Node):
             if not self.detected:
                 self.get_logger().info("Lost target → CENTERING")
                 self.state = "CENTERING"
+                self.set_camera("bottom")
                 return
 
             # Move forward + yaw correction
@@ -368,7 +376,18 @@ class MissionNode(Node):
         )
 
         return output, integral
-    
+
+    def set_camera(self, cam):
+
+        msg = Float32MultiArray()
+
+        if cam == "front":
+            msg.data = [0.0]
+        else:
+            msg.data = [1.0]
+
+        self.cam_pub.publish(msg)
+
 def main():
     rclpy.init()
     node = MissionNode()
