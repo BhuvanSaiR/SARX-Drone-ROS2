@@ -18,21 +18,34 @@ class DetectionNode(Node):
         super().__init__('detection_node')
 
         self.bridge = CvBridge()
-
+        self.active_camera = "front"
         # Subscribe to FRONT camera
         self.sub = self.create_subscription(
-            Image,
-            '/camera/front',
-            self.front_callback,
-            10
+            Image, 
+            '/camera/front', 
+            self.front_callback, 
+            1
         )
-
+        # Subscribe to BOTTOM camera
+        self.sub_bottom = self.create_subscription(
+            Image,
+            '/camera/bottom',
+            self.bottom_callback,
+            1
+        )
+        # Subscribe to active camera topic
+        self.cam_sub = self.create_subscription(
+            Float32MultiArray,
+            '/active_camera',
+            self.camera_callback,
+            1
+        )
         # Publish detection result
         self.pub = self.create_publisher(
             Float32MultiArray,
             '/detection/front',
-            10
-        )
+            1
+        )   
 
         # ---- Load YOUR model ----
         self.device = select_device("cpu")
@@ -53,25 +66,26 @@ class DetectionNode(Node):
         self.IMG_SIZE = 320
         self.CONF_THRES = 0.25
         self.IOU_THRES = 0.45
-        self.sub_bottom = self.create_subscription(
-            Image,
-            '/camera/bottom',
-            self.bottom_callback,
-            10
-        )
 
         self.pub_bottom = self.create_publisher(
             Float32MultiArray,
             '/detection/bottom',
-            10
+            1
         )
 
     def front_callback(self, msg):
-        self.process_frame(msg, self.pub)
+
+        if self.active_camera != "front":
+            return
+
+        self.process_frame(msg, self.pub, "front")
 
     def bottom_callback(self, msg):
-        self.process_frame(msg, self.pub_bottom)
-    
+        if self.active_camera != "bottom":
+            return
+
+        self.process_frame(msg, self.pub_bottom, "bottom")    
+
     # def process_frame(self, msg, publisher):
         # # Convert ROS Image to OpenCV
         # cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -97,15 +111,21 @@ class DetectionNode(Node):
         # msg_out = Float32MultiArray()
         # msg_out.data = [coord for det in detections for coord in det]
         # publisher.publish(msg_out)
-    def process_frame(self, msg, publisher):
 
-        # Convert ROS → OpenCV
-        frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+    def process_frame(self, msg, publisher, cam_name):
+
+        try:
+            # Convert ROS → OpenCV
+            frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+        except Exception as e:
+            self.get_logger().error(f"Image conversion failed: {e}")
+            return
         orig_h, orig_w = frame.shape[:2]
 
         # ---- PREPROCESS ----
         img = cv2.resize(frame, (self.IMG_SIZE, self.IMG_SIZE))
         img = img.transpose(2, 0, 1)
+        img = np.ascontiguousarray(img)
 
         img = torch.from_numpy(img).to(self.device)
         img = img.float() / 255.0
@@ -114,6 +134,9 @@ class DetectionNode(Node):
         # ---- INFERENCE ----
         with torch.no_grad():
             pred = self.model(img)
+
+        if isinstance(pred, tuple):
+            pred = pred[0]
 
         pred = non_max_suppression(
             pred,
@@ -159,12 +182,24 @@ class DetectionNode(Node):
                     found = 1.0
 
             area_ratio = max_area / (orig_w * orig_h)
-
+        # ---- DEBUG LOG (ADD HERE) ----
+        self.get_logger().debug(
+            f"[{cam_name}] Found: {found}, Area: {area_ratio:.2f}"
+        )
         # ---- PUBLISH ----
         msg_out = Float32MultiArray()
         msg_out.data = [found, area_ratio, cx, cy]
 
         publisher.publish(msg_out)
+
+    def camera_callback(self, msg):
+
+        if msg.data[0] == 0.0:
+            self.active_camera = "front"
+        else:
+            self.active_camera = "bottom"
+
+        self.get_logger().info(f"[Detection] Active camera: {self.active_camera}")
 
 def main():
     rclpy.init()
