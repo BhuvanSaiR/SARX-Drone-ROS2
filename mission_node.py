@@ -9,7 +9,6 @@ class MissionNode(Node):
 
     def __init__(self):
         super().__init__('mission_node')
-
         # ============================
         # STATE MACHINE
         # ============================
@@ -35,14 +34,14 @@ class MissionNode(Node):
             Float32MultiArray,
             '/perception/target',
             self.perception_callback,
-            10
+            1
         )
 
         self.wp_sub = self.create_subscription(
             Float32MultiArray,
             '/mission_waypoints',
             self.waypoint_callback,
-            10
+            1
         )
 
         # ============================
@@ -51,31 +50,32 @@ class MissionNode(Node):
         self.cmd_pub = self.create_publisher(
             Float32MultiArray,
             '/command',
-            10
+            1
         )
 
         self.drop_pub = self.create_publisher(
             Float32MultiArray,
             '/drop',
-            10
+            1
         )
 
         self.gps_pub = self.create_publisher(
             Float32MultiArray,
             '/goto_gps',
-            10
+            1
         )
 
         self.cam_pub = self.create_publisher(
             Float32MultiArray,
             '/active_camera',
-            10
+            1
         )
 
         # ============================
         # TIMERS
         # ============================
         self.timer = self.create_timer(0.1, self.control_loop)
+        self.last_detection_time = time.time()
 
         # ============================
         # CURRENT STATE DATA
@@ -86,7 +86,7 @@ class MissionNode(Node):
         self.cy = 0.0
         self.area = 0.0
 
-        self.get_logger().info("Mission node fully initialized")
+        self.get_logger().debug("Mission node fully initialized")
 
         # ---- GPS State ----
         self.current_lat = None
@@ -95,7 +95,7 @@ class MissionNode(Node):
             Float32MultiArray,
             '/gps',
             self.gps_callback,
-            10
+            1
         )
         # ============================
         # PID PARAMETERS
@@ -121,7 +121,19 @@ class MissionNode(Node):
     # ======================================
 
     def perception_callback(self, msg):
-        self.detected, self.approach, self.cx, self.cy, self.area = msg.data
+        data = msg.data
+
+        if len(data) != 5:
+            self.get_logger().warn("Invalid perception data")
+            return
+
+        detected, approach, cx, cy, area = data
+
+        self.detected = detected > 0.5
+        self.approach = approach > 0.5
+        self.cx = cx
+        self.cy = cy
+        self.area = area
 
     def waypoint_callback(self, msg):
 
@@ -135,19 +147,19 @@ class MissionNode(Node):
 
         self.current_wp = 0
 
-        self.get_logger().info(f"Loaded {len(self.waypoints)} waypoints")
+        self.get_logger().debug(f"Loaded {len(self.waypoints)} waypoints")
 
     # ======================================
     # MAIN CONTROL LOOP
     # ======================================
 
     def control_loop(self):
-
+        self.get_logger().debug(f"STATE: {self.state}")
         # -------- SEARCHING (Waypoint Following) --------
         if self.state == "SEARCHING":
             self.set_camera("front")
             if self.detected:
-                self.get_logger().info("Human detected → APPROACHING")
+                self.get_logger().debug("Human detected → APPROACHING")
 
                 self.save_checkpoint()
                 self.state = "APPROACHING"
@@ -159,20 +171,30 @@ class MissionNode(Node):
         # -------- APPROACHING --------
         elif self.state == "APPROACHING":
 
-            if not self.detected:
-                self.get_logger().info("Lost target → CENTERING")
+            if self.detected:
+                self.last_detection_time = time.time()
+            else:
+                if time.time() - self.last_detection_time > 1.0:
+                    self.get_logger().warn("Detection timeout → SEARCHING")
+                    self.state = "SEARCHING"
+                    return
+
+                self.get_logger().debug("Lost target → CENTERING")
                 self.state = "CENTERING"
                 self.set_camera("bottom")
                 return
 
             # Move forward + yaw correction
-            self.publish_velocity(1.0, self.cx, 0.0)
+            forward_speed = max(0.2, min(0.8, 1.0 - self.area))  # Change to trapezium curve later
+            yaw_cmd = max(min(self.cx, 0.5), -0.5)
+            self.publish_velocity(forward_speed, yaw_cmd, 0.0)
 
         # -------- CENTERING --------
         elif self.state == "CENTERING":
-
+            self.stop_motion()
             now = time.time()
             dt = now - self.prev_time
+            dt = min(dt, 0.1)
             self.prev_time = now
 
             error_x = self.cx
@@ -201,13 +223,13 @@ class MissionNode(Node):
             output_x = max(min(output_x, 1.0), -1.0)
             output_y = max(min(output_y, 1.0), -1.0)
 
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"PID -> X: {output_x:.2f}, Y: {output_y:.2f}"
             )
 
             # Check centered condition
             if abs(error_x) < 0.03 and abs(error_y) < 0.03:
-                self.get_logger().info("Centered → DESCENDING")
+                self.get_logger().debug("Centered → DESCENDING")
 
                 # Reset PID integrals for next phase
                 self.integral_x = 0.0
@@ -221,27 +243,39 @@ class MissionNode(Node):
 
         # -------- DESCENDING --------
         elif self.state == "DESCENDING":
+            self.stop_motion()
 
-            self.get_logger().info("Descending...")
-            self.publish_velocity(0.0, 0.0, -0.5)
+            self.get_logger().debug("Descending...")
+            if abs(self.cx) < 0.05 and abs(self.cy) < 0.05:
+                self.publish_velocity(0.0, 0.0, -0.5)
+                self.descend_start = time.time()
+                self.state = "WAIT_AFTER_DESCEND"
+            else:
+                self.get_logger().warn("Not centered → abort descent")
+                self.state = "CENTERING"
 
-            time.sleep(2)
-
-            self.state = "DROPPING"
+        # -------- WAIT AFTER DESCEND --------
+        elif self.state == "WAIT_AFTER_DESCEND":
+            if time.time() - self.descend_start >= 2.0:
+                self.state = "DROPPING"
 
         # -------- DROPPING --------
         elif self.state == "DROPPING":
 
-            self.get_logger().info("Dropping payload")
+            self.get_logger().debug("Dropping payload")
 
             msg = Float32MultiArray()
             msg.data = [1.0]
             self.drop_pub.publish(msg)
 
-            time.sleep(1)
-
-            self.returning_from_drop = True
-            self.state = "RETURNING"
+            self.drop_time = time.time()
+            self.state = "WAIT_AFTER_DROP"
+        # -------- WAIT AFTER DROP --------
+        elif self.state == "WAIT_AFTER_DROP":
+            if time.time() - self.drop_time >= 1.0:
+                self.returning_from_drop = True
+                self.stop_motion()
+                self.state = "RETURNING"
 
         # -------- RETURNING --------
         elif self.state == "RETURNING":
@@ -255,7 +289,7 @@ class MissionNode(Node):
             self.publish_gps_target(lat, lon)
 
             if self.reached_checkpoint():
-                self.get_logger().info("Reached checkpoint → SEARCHING")
+                self.get_logger().debug("Reached checkpoint → SEARCHING")
 
                 self.returning_from_drop = False
                 self.state = "SEARCHING"
@@ -267,36 +301,43 @@ class MissionNode(Node):
     def follow_waypoints(self):
 
         if len(self.waypoints) == 0:
+            self.get_logger().warn("No waypoints loaded")
             return
 
+        if self.current_wp >= len(self.waypoints):
+            return
         lat, lon = self.waypoints[self.current_wp]
-
+        
         self.publish_gps_target(lat, lon)
 
         if self.reached_waypoint(lat, lon):
-            self.get_logger().info(f"Reached WP {self.current_wp}")
+            self.get_logger().debug(f"Reached WP {self.current_wp}")
 
             self.current_wp += 1
 
             if self.current_wp >= len(self.waypoints):
-                self.get_logger().info("Mission complete")
+                self.get_logger().debug("Mission complete")
                 self.current_wp = 0
-
+        
     # ======================================
     # HELPERS
     # ======================================
 
     def publish_velocity(self, forward, yaw, vertical):
 
-        msg = Float32MultiArray()
-        msg.data = [float(forward), float(yaw), float(vertical)]
-        self.cmd_pub.publish(msg)
         forward = max(min(forward, 1.0), -1.0)
         yaw = max(min(yaw, 1.0), -1.0)
         vertical = max(min(vertical, 1.0), -1.0)
 
-    def publish_gps_target(self, lat, lon):
+        msg = Float32MultiArray()
+        msg.data = [float(forward), float(yaw), float(vertical)]
 
+        self.cmd_pub.publish(msg)
+
+    def publish_gps_target(self, lat, lon):
+        if self.current_lat is None:
+            self.get_logger().warn("No GPS → holding position")
+            return
         msg = Float32MultiArray()
         msg.data = [float(lat), float(lon)]
         self.gps_pub.publish(msg)
@@ -304,8 +345,9 @@ class MissionNode(Node):
     def save_checkpoint(self):
         # Placeholder (replace with real GPS reading later)
         if self.current_wp < len(self.waypoints):
-            self.checkpoint = self.waypoints[self.current_wp]
-            self.get_logger().info(f"Checkpoint saved: {self.checkpoint}")
+            if self.current_lat is not None:
+                self.checkpoint = (self.current_lat, self.current_lon)
+                self.get_logger().debug(f"Checkpoint saved: {self.checkpoint}")
 
     def reached_waypoint(self, lat, lon):
 
@@ -319,7 +361,7 @@ class MissionNode(Node):
             lon
         )
 
-        self.get_logger().info(f"Distance to WP: {dist:.2f} m")
+        self.get_logger().debug(f"Distance to WP: {dist:.2f} m")
 
         return dist < self.wp_tolerance
 
@@ -340,7 +382,7 @@ class MissionNode(Node):
             lon
         )
 
-        self.get_logger().info(f"Distance to checkpoint: {dist:.2f} m")
+        self.get_logger().debug(f"Distance to checkpoint: {dist:.2f} m")
 
         return dist < self.wp_tolerance
     
@@ -364,9 +406,14 @@ class MissionNode(Node):
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
         return R * c 
+    
     def pid_control(self, error, prev_error, integral, dt):
 
         integral += error * dt
+
+        # Integral Clamping to prevent windup
+        integral = max(min(integral, 1.0), -1.0)
+
         derivative = (error - prev_error) / dt if dt > 0 else 0.0
 
         output = (
@@ -379,6 +426,14 @@ class MissionNode(Node):
 
     def set_camera(self, cam):
 
+        if not hasattr(self, 'current_camera'):
+            self.current_camera = None
+
+        if self.current_camera == cam:
+            return
+
+        self.current_camera = cam
+
         msg = Float32MultiArray()
 
         if cam == "front":
@@ -387,6 +442,10 @@ class MissionNode(Node):
             msg.data = [1.0]
 
         self.cam_pub.publish(msg)
+        self.get_logger().debug(f"Switched to {cam} camera")
+
+    def stop_motion(self):
+        self.publish_velocity(0.0, 0.0, 0.0)
 
 def main():
     rclpy.init()

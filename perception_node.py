@@ -14,21 +14,21 @@ class PerceptionNode(Node):
             Float32MultiArray,
             '/detection/front',
             self.front_callback,
-            10
+            1
         )
 
         # Publish refined perception
         self.pub = self.create_publisher(
             Float32MultiArray,
             '/perception/target',
-            10
+            1
         )
 
         self.sub_bottom = self.create_subscription(
             Float32MultiArray,
             '/detection/bottom',
             self.bottom_callback,
-            10
+            1
         )
 
         self.bottom_data = None
@@ -38,12 +38,12 @@ class PerceptionNode(Node):
             Float32MultiArray,
             '/active_camera',
             self.camera_callback,
-            10
+            1
         )
         
         # ---- YOUR THRESHOLDS ----
-        self.AREA_THRESHOLD_FRONT = 0.15
-        self.AREA_THRESHOLD_BOTTOM = 0.15
+        self.AREA_THRESHOLD_FRONT = 0.12
+        self.AREA_THRESHOLD_BOTTOM = 0.20
         self.get_logger().info("Perception node started")
         self.active_camera = "front"
 
@@ -63,19 +63,23 @@ class PerceptionNode(Node):
             data = self.bottom_data
 
         if data is None:
+            self.get_logger().warn(f"No data from {self.active_camera}")
+            return
+
+        if len(data) != 4:
+            self.get_logger().warn("Invalid detection data")
             return
 
         found, area, cx, cy = data
 
         target_detected = found > 0.5
 
-        # Use correct threshold
         if self.active_camera == "front":
             approach = area > self.AREA_THRESHOLD_FRONT
         else:
             approach = area > self.AREA_THRESHOLD_BOTTOM
 
-        self.get_logger().info(
+        self.get_logger().debug(
             f"[{self.active_camera}] Detected: {target_detected}, Area: {area:.2f}"
         )
 
@@ -97,4 +101,4 @@ class PerceptionNode(Node):
         else:
             self.active_camera = "bottom"
 
-        self.get_logger().info(f"[Perception] Using {self.active_camera} camera")
+        self.get_logger().debug(f"[Perception] Using {self.active_camera} camera")
