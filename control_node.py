@@ -35,6 +35,9 @@ class ControlNode(Node):
         self.yaw_scale = 30.0
         self.get_logger().info("Control node started")
         self.last_cmd_time = self.loop.time()
+        self.received_first_cmd = False
+        self.offboard_started = False
+
     # ============================
     # ASYNC LOOP (from your code)
     # ============================
@@ -76,6 +79,8 @@ class ControlNode(Node):
 
         try:
             await self.drone.offboard.start()
+            self.offboard_started = True
+            self.get_logger().info("Offboard control enabled")
         except Exception as e:
             self.get_logger().error(f"Offboard failed: {e}")
             await self.drone.action.land()
@@ -83,6 +88,7 @@ class ControlNode(Node):
 
         asyncio.create_task(self.publish_gps())
         asyncio.create_task(self.command_watchdog())
+        self.get_logger().info("Command watchdog started")
 
         self.get_logger().info("Offboard mode started")
         
@@ -101,11 +107,13 @@ class ControlNode(Node):
         self.loop.call_soon_threadsafe(
             asyncio.create_task,
             self.send_velocity(forward, yaw, vertical)
-        )
+        )   
+        self.received_first_cmd = True
         self.last_cmd_time = self.loop.time()
 
     async def send_velocity(self, forward, yaw, vertical):
-
+        if not self.offboard_started:
+            return
         try:
             forward = max(min(forward, 0.8), -0.5)
             vertical = max(min(vertical, 1.0), -1.0)
@@ -133,6 +141,7 @@ class ControlNode(Node):
             msg.data = [lat, lon]
 
             self.gps_pub.publish(msg)
+            await asyncio.sleep(0.1)
 
     def destroy_node(self):
 
@@ -145,9 +154,9 @@ class ControlNode(Node):
         super().destroy_node()
 
     async def safe_shutdown(self):
-
         try:
-            await self.drone.offboard.stop()
+            if self.offboard_started:
+                await self.drone.offboard.stop()
             await self.drone.action.land()
         except Exception as e:
             self.get_logger().error(f"Shutdown error: {e}")
@@ -156,11 +165,18 @@ class ControlNode(Node):
 
         while True:
             await asyncio.sleep(0.1)
+            if not self.offboard_started:
+                continue
+
+            if not self.received_first_cmd:
+                continue
 
             if self.loop.time() - self.last_cmd_time > 0.5:
                 await self.drone.offboard.set_velocity_body(
                     VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0)
                 )
+                self.get_logger().warn("Command timeout → stopping drone")
+
 def main():
     rclpy.init()
     node = ControlNode()
